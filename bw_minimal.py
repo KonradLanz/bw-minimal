@@ -289,16 +289,16 @@ class BwSession:
         if debug:
             print(f"  [debug] /api/ciphers keys={list(ciphers.keys())} count={len(items)}", file=sys.stderr)
         for item in items:
-            raw_name = item.get("Name", "")
+            raw_name = item.get("name") or item.get("Name") or ""
             try:
                 item_name = _decrypt_cipher_string(
                     raw_name, self.enc_key, self.mac_key
                 ).decode("utf-8")
             except Exception:
-                # Name may already be plaintext (older Vaultwarden / bw CLI items)
                 item_name = raw_name
+            item_type = item.get("type") or item.get("Type")
             if debug:
-                print(f"  [debug] item: {repr(item_name)!s:40s} type={item.get('Type')}", file=sys.stderr)
+                print(f"  [debug] item: {repr(item_name)!s:40s} type={item_type}", file=sys.stderr)
             if item_name == name_target:
                 return item
         return None
@@ -308,9 +308,10 @@ class BwSession:
         item = self._find_item(key)
         if item is None:
             return None
-        if item.get("Type") != 2:
-            raise RuntimeError(f"Item 'kl: {key}' is not a secure note (type {item.get('Type')}). Use get-user/get-pass for login items.")
-        notes = item.get("Notes")
+        item_type = item.get("type") or item.get("Type")
+        if item_type != 2:
+            raise RuntimeError(f"Item 'kl: {key}' is not a secure note (type {item_type}). Use get-user/get-pass for login items.")
+        notes = item.get("notes") or item.get("Notes")
         if not notes:
             return ""
         return _decrypt_cipher_string(notes, self.enc_key, self.mac_key).decode("utf-8")
@@ -320,8 +321,8 @@ class BwSession:
         item = self._find_item(key)
         if item is None:
             return None
-        login = item.get("Login") or {}
-        username = login.get("Username")
+        login = item.get("login") or item.get("Login") or {}
+        username = login.get("username") or login.get("Username")
         if not username:
             return ""
         return _decrypt_cipher_string(username, self.enc_key, self.mac_key).decode("utf-8")
@@ -331,8 +332,8 @@ class BwSession:
         item = self._find_item(key)
         if item is None:
             return None
-        login = item.get("Login") or {}
-        password = login.get("Password")
+        login = item.get("login") or item.get("Login") or {}
+        password = login.get("password") or login.get("Password")
         if not password:
             return ""
         return _decrypt_cipher_string(password, self.enc_key, self.mac_key).decode("utf-8")
