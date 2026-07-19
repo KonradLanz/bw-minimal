@@ -285,7 +285,10 @@ class BwSession:
         name_target = f"{ITEM_PREFIX}{key}"
         ciphers = _get_json(f"{self.server}/api/ciphers", self.access_token)
         debug = os.environ.get("BW_DEBUG")
-        for item in ciphers.get("Data", []):
+        items = ciphers.get("Data") or ciphers.get("data") or []
+        if debug:
+            print(f"  [debug] /api/ciphers keys={list(ciphers.keys())} count={len(items)}", file=sys.stderr)
+        for item in items:
             raw_name = item.get("Name", "")
             try:
                 item_name = _decrypt_cipher_string(
