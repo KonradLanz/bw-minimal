@@ -125,10 +125,11 @@ def _stretch_key(master_key: bytes) -> tuple[bytes, bytes]:
     return enc_key, mac_key
 
 
-def _decrypt_cipher_string(cipher_str: str, enc_key: bytes, mac_key: bytes) -> str:
+def _decrypt_cipher_string(cipher_str: str, enc_key: bytes, mac_key: bytes) -> bytes:
     """
     Decrypt Bitwarden CipherString type 2 (AES-256-CBC + HMAC-SHA256).
     Format: 2.<iv_b64>|<ct_b64>|<mac_b64>
+    Always returns raw bytes — callers decode to str when needed.
     """
     if not cipher_str.startswith("2."):
         raise ValueError(f"Unsupported CipherString type: {cipher_str[:2]}")
@@ -146,12 +147,12 @@ def _decrypt_cipher_string(cipher_str: str, enc_key: bytes, mac_key: bytes) -> s
         from Crypto.Cipher import AES
         from Crypto.Util.Padding import unpad
         cipher = AES.new(enc_key, AES.MODE_CBC, iv)
-        return unpad(cipher.decrypt(ct), 16).decode("utf-8")
+        return unpad(cipher.decrypt(ct), 16)
     except ImportError:
         return _decrypt_aes_openssl(ct, enc_key, iv)
 
 
-def _decrypt_aes_openssl(ct: bytes, key: bytes, iv: bytes) -> str:
+def _decrypt_aes_openssl(ct: bytes, key: bytes, iv: bytes) -> bytes:
     """AES-256-CBC decrypt via openssl subprocess (fallback, no pycryptodome)."""
     import subprocess
     import tempfile
@@ -166,7 +167,7 @@ def _decrypt_aes_openssl(ct: bytes, key: bytes, iv: bytes) -> str:
         )
         if result.returncode != 0:
             raise ValueError(f"openssl decrypt failed: {result.stderr.decode().strip()}")
-        return result.stdout.decode("utf-8")
+        return result.stdout  # raw bytes — caller decodes
     finally:
         os.unlink(ct_path)
 
@@ -271,12 +272,9 @@ class BwSession:
         vault_key_cipher = profile["key"]
 
         # 5. Decrypt vault key with stretched master key
-        #    vault_key_raw is 64 bytes: [0:32] = enc key, [32:64] = mac key
+        #    vault_key_raw is 64 raw bytes: [0:32] = enc key, [32:64] = mac key
         enc_key, mac_key  = _stretch_key(master_key)
-        vault_key_raw     = _decrypt_cipher_string(vault_key_cipher, enc_key, mac_key)
-        vault_key_bytes   = (vault_key_raw.encode("latin-1")
-                             if isinstance(vault_key_raw, str)
-                             else vault_key_raw)
+        vault_key_bytes   = _decrypt_cipher_string(vault_key_cipher, enc_key, mac_key)
         self.enc_key = vault_key_bytes[:32]
         self.mac_key = vault_key_bytes[32:64]
 
@@ -292,14 +290,14 @@ class BwSession:
             try:
                 item_name = _decrypt_cipher_string(
                     item["Name"], self.enc_key, self.mac_key
-                )
+                ).decode("utf-8")
             except Exception:
                 continue
             if item_name == name_target:
                 notes = item.get("Notes")
                 if not notes:
                     return ""
-                return _decrypt_cipher_string(notes, self.enc_key, self.mac_key)
+                return _decrypt_cipher_string(notes, self.enc_key, self.mac_key).decode("utf-8")
         return None
 
 
