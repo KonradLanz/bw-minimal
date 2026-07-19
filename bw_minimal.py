@@ -339,13 +339,30 @@ class BwSession:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+_SESSION_FILE = os.path.expanduser("~/.bw_session")
+
+def _load_session_file() -> str:
+    """Read cached session token from ~/.bw_session (600 perms)."""
+    try:
+        with open(_SESSION_FILE) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+def _save_session_file(token: str) -> None:
+    """Persist session token to ~/.bw_session with mode 600."""
+    import stat
+    with open(_SESSION_FILE, "w") as f:
+        f.write(token)
+    os.chmod(_SESSION_FILE, stat.S_IRUSR | stat.S_IWUSR)
+
 def _get_session() -> BwSession:
     server = os.environ.get("BW_SERVER", SELF_HOSTED_DEFAULT)
     # Defer email prompt — only needed if BW_SESSION is absent or expired
     email  = os.environ.get("BW_EMAIL") or None
 
-    # Reuse existing session token if set — skip full unlock (no master password needed)
-    existing_token = os.environ.get("BW_SESSION", "").strip()
+    # Reuse existing session token — env takes priority, then ~/.bw_session
+    existing_token = os.environ.get("BW_SESSION", "").strip() or _load_session_file()
     if existing_token:
         print(f"  Reusing BW_SESSION ({server}) ...", file=sys.stderr)
         if not email:
@@ -382,6 +399,7 @@ def _get_session() -> BwSession:
     print(f"  Connecting to {server} ...", file=sys.stderr)
     s = BwSession(server, email, master)
     s.unlock()
+    _save_session_file(s.access_token)
     return s
 
 
@@ -413,6 +431,7 @@ def main() -> None:
 
     if cmd == "unlock":
         s = _get_session()
+        _save_session_file(s.access_token)
         print(s.access_token)
 
     elif cmd in ("get", "get-user", "get-pass"):
