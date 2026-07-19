@@ -336,12 +336,16 @@ class BwSession:
 
 def _get_session() -> BwSession:
     server = os.environ.get("BW_SERVER", SELF_HOSTED_DEFAULT)
-    email  = os.environ.get("BW_EMAIL")  or input("Email: ")
+    # Defer email prompt — only needed if BW_SESSION is absent or expired
+    email  = os.environ.get("BW_EMAIL") or None
 
     # Reuse existing session token if set — skip full unlock (no master password needed)
     existing_token = os.environ.get("BW_SESSION", "").strip()
     if existing_token:
         print(f"  Reusing BW_SESSION ({server}) ...", file=sys.stderr)
+        if not email:
+            email = input("Email: ")
+            os.environ["BW_EMAIL"] = email
         s = BwSession(server, email, "")
         s.access_token = existing_token
         # We still need enc/mac keys — fetch profile and derive from token
@@ -365,6 +369,9 @@ def _get_session() -> BwSession:
             print(f"  BW_SESSION invalid/expired ({e}), re-authenticating ...", file=sys.stderr)
             os.environ.pop("BW_SESSION", None)
 
+    if not email:
+        email = input("Email: ")
+        os.environ["BW_EMAIL"] = email
     master = os.environ.get("BW_MASTER") or getpass.getpass("Master password: ")
     os.environ["BW_MASTER"] = master
     print(f"  Connecting to {server} ...", file=sys.stderr)
