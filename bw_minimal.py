@@ -284,13 +284,18 @@ class BwSession:
         """Return the raw cipher dict for 'kl: <key>', any type."""
         name_target = f"{ITEM_PREFIX}{key}"
         ciphers = _get_json(f"{self.server}/api/ciphers", self.access_token)
+        debug = os.environ.get("BW_DEBUG")
         for item in ciphers.get("Data", []):
+            raw_name = item.get("Name", "")
             try:
                 item_name = _decrypt_cipher_string(
-                    item["Name"], self.enc_key, self.mac_key
+                    raw_name, self.enc_key, self.mac_key
                 ).decode("utf-8")
             except Exception:
-                continue
+                # Name may already be plaintext (older Vaultwarden / bw CLI items)
+                item_name = raw_name
+            if debug:
+                print(f"  [debug] item: {repr(item_name)!s:40s} type={item.get('Type')}", file=sys.stderr)
             if item_name == name_target:
                 return item
         return None
