@@ -9,11 +9,13 @@
 #   python3 bw_minimal.py set "nas/ssh_pass" "value"
 #   python3 bw_minimal.py unlock
 #
-# Environment:
-#   BW_SERVER   Vaultwarden URL (default: https://vault.bitwarden.com)
-#   BW_EMAIL    Account email
-#   BW_MASTER   Master password (avoid in production — use prompt)
-#   BW_SESSION  Existing session token
+# Environment (priority: shell env > dotfiles env > .env > prompt):
+#   KL_DOTFILES_ENV  Path to dotfiles env file (default: ~/git/dotfiles/env)
+#   BW_SERVER        Vaultwarden URL       (default: https://vault.own.dedyn.io
+#                                           if dotfiles env found, else bitwarden cloud)
+#   BW_EMAIL         Account email
+#   BW_MASTER        Master password (prefer prompt over setting this)
+#   BW_SESSION       Existing session token
 #
 # Item convention: keys stored as secure notes named "kl: <key>"
 
@@ -29,13 +31,65 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DEFAULT_SERVER = "https://vault.bitwarden.com"
-ITEM_PREFIX = "kl: "
+SELF_HOSTED_DEFAULT = "https://vault.own.dedyn.io"
+CLOUD_DEFAULT       = "https://vault.bitwarden.com"
+ITEM_PREFIX         = "kl: "
+
+
+# ---------------------------------------------------------------------------
+# Env loading (shell env > dotfiles env > .env file)
+# ---------------------------------------------------------------------------
+
+def _parse_env_file(path: Path) -> dict[str, str]:
+    """Parse a simple KEY=VALUE env file, ignoring comments and blank lines."""
+    result: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            # Skip placeholder comments and empty values
+            if val and not val.startswith("←"):
+                result[key] = val
+    except (OSError, UnicodeDecodeError):
+        pass
+    return result
+
+
+def _load_env() -> None:
+    """
+    Load env variables in priority order (lowest first, higher overwrites):
+      1. .env in script directory
+      2. KL_DOTFILES_ENV or ~/git/dotfiles/env
+      3. Existing shell environment (never overwritten)
+    """
+    script_dir = Path(__file__).parent
+
+    # Layer 1: .env next to script
+    local_env = script_dir / ".env"
+    for k, v in _parse_env_file(local_env).items():
+        os.environ.setdefault(k, v)
+
+    # Layer 2: dotfiles env
+    dotfiles_env_path = os.environ.get("KL_DOTFILES_ENV") or \
+        str(Path.home() / "git" / "dotfiles" / "env")
+    dotfiles_env = Path(os.path.expanduser(dotfiles_env_path))
+    if dotfiles_env.is_file():
+        for k, v in _parse_env_file(dotfiles_env).items():
+            os.environ.setdefault(k, v)
+        # If dotfiles env found and BW_SERVER still unset, default to self-hosted
+        os.environ.setdefault("BW_SERVER", SELF_HOSTED_DEFAULT)
+    else:
+        os.environ.setdefault("BW_SERVER", CLOUD_DEFAULT)
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +97,6 @@ ITEM_PREFIX = "kl: "
 # ---------------------------------------------------------------------------
 
 def _pbkdf2(password: str, salt: str, iterations: int, keylen: int = 32) -> bytes:
-    """Derive master key via PBKDF2-SHA256."""
     return hashlib.pbkdf2_hmac(
         "sha256",
         password.encode("utf-8"),
@@ -54,7 +107,7 @@ def _pbkdf2(password: str, salt: str, iterations: int, keylen: int = 32) -> byte
 
 
 def _hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
-    """HKDF-Expand (RFC 5869) — used to derive enc/mac keys from master key."""
+    """HKDF-Expand (RFC 5869)."""
     t = b""
     okm = b""
     for i in range(1, -(-length // 32) + 1):
@@ -64,7 +117,6 @@ def _hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
 
 
 def _stretch_key(master_key: bytes) -> tuple[bytes, bytes]:
-    """Stretch master key into enc_key + mac_key (Bitwarden key expansion)."""
     enc_key = _hkdf_expand(master_key, b"enc", 32)
     mac_key = _hkdf_expand(master_key, b"mac", 32)
     return enc_key, mac_key
@@ -72,36 +124,34 @@ def _stretch_key(master_key: bytes) -> tuple[bytes, bytes]:
 
 def _decrypt_cipher_string(cipher_str: str, enc_key: bytes, mac_key: bytes) -> str:
     """
-    Decrypt a Bitwarden CipherString (type 2 = AES-CBC-256 + HMAC-SHA256).
+    Decrypt Bitwarden CipherString type 2 (AES-256-CBC + HMAC-SHA256).
     Format: 2.<iv_b64>|<ct_b64>|<mac_b64>
     """
-    # Lazy import — AES not in stdlib, use openssl via subprocess as fallback
-    try:
-        from Crypto.Cipher import AES  # pycryptodome if available
-        _decrypt_aes = _decrypt_aes_pycrypto
-    except ImportError:
-        _decrypt_aes = _decrypt_aes_openssl
-
     if not cipher_str.startswith("2."):
         raise ValueError(f"Unsupported CipherString type: {cipher_str[:2]}")
-
     _, payload = cipher_str.split(".", 1)
     parts = payload.split("|")
     iv = base64.b64decode(parts[0])
     ct = base64.b64decode(parts[1])
     mac = base64.b64decode(parts[2])
 
-    # Verify HMAC
     expected_mac = hmac.new(mac_key, iv + ct, "sha256").digest()
     if not hmac.compare_digest(expected_mac, mac):
         raise ValueError("HMAC verification failed — wrong key or corrupted data")
 
-    return _decrypt_aes(ct, enc_key, iv)
+    try:
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import unpad
+        cipher = AES.new(enc_key, AES.MODE_CBC, iv)
+        return unpad(cipher.decrypt(ct), 16).decode("utf-8")
+    except ImportError:
+        return _decrypt_aes_openssl(ct, enc_key, iv)
 
 
 def _decrypt_aes_openssl(ct: bytes, key: bytes, iv: bytes) -> str:
-    """AES-256-CBC decrypt via openssl subprocess (no pycryptodome needed)."""
-    import subprocess, tempfile
+    """AES-256-CBC decrypt via openssl subprocess (fallback, no pycryptodome)."""
+    import subprocess
+    import tempfile
     with tempfile.NamedTemporaryFile(delete=False) as f:
         f.write(ct)
         ct_path = f.name
@@ -112,29 +162,30 @@ def _decrypt_aes_openssl(ct: bytes, key: bytes, iv: bytes) -> str:
             capture_output=True,
         )
         if result.returncode != 0:
-            raise ValueError(f"openssl decrypt failed: {result.stderr.decode()}")
+            raise ValueError(f"openssl decrypt failed: {result.stderr.decode().strip()}")
         return result.stdout.decode("utf-8")
     finally:
         os.unlink(ct_path)
-
-
-def _decrypt_aes_pycrypto(ct: bytes, key: bytes, iv: bytes) -> str:
-    from Crypto.Cipher import AES
-    from Crypto.Util.Padding import unpad
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    return unpad(cipher.decrypt(ct), 16).decode("utf-8")
 
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
-def _post(url: str, data: dict, headers: Optional[dict] = None) -> dict:
+def _post_form(url: str, data: dict) -> dict:
     body = urllib.parse.urlencode(data).encode()
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    for k, v in (headers or {}).items():
-        req.add_header(k, v)
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+def _post_json(url: str, data: dict, token: Optional[str] = None) -> dict:
+    body = json.dumps(data).encode()
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(req) as resp:
         return json.loads(resp.read())
 
@@ -162,95 +213,110 @@ class BwSession:
     def unlock(self) -> str:
         """Login + derive keys. Returns access token."""
         # 1. Prelogin — get KDF params
-        prelogin = _post(
+        prelogin = _post_json(
             f"{self.server}/api/accounts/prelogin",
             {"email": self.email},
-            {"Content-Type": "application/json"},
         )
-        # Vaultwarden returns JSON — re-post as JSON
-        prelogin = self._post_json(f"{self.server}/api/accounts/prelogin",
-                                   {"email": self.email})
         iterations = prelogin.get("kdfIterations", 600000)
 
-        # 2. Derive master key
+        # 2. Derive master key + master password hash
         master_key = _pbkdf2(self.master, self.email, iterations)
-
-        # 3. Derive master password hash (sent to server)
-        master_hash_raw = _pbkdf2(self.master, self.email, iterations)
         master_hash = base64.b64encode(
-            hashlib.pbkdf2_hmac("sha256", master_hash_raw,
-                                self.master.encode(), 1)
+            hashlib.pbkdf2_hmac("sha256", master_key,
+                                self.master.encode("utf-8"), 1)
         ).decode()
 
-        # 4. Login
-        token_resp = _post(
+        # 3. Login — get access token
+        token_resp = _post_form(
             f"{self.server}/identity/connect/token",
             {
-                "grant_type": "password",
-                "username": self.email,
-                "password": master_hash,
-                "scope": "api offline_access",
-                "client_id": "cli",
-                "deviceType": "8",
+                "grant_type":       "password",
+                "username":         self.email,
+                "password":         master_hash,
+                "scope":            "api offline_access",
+                "client_id":        "cli",
+                "deviceType":       "8",
                 "deviceIdentifier": "bw-minimal",
-                "deviceName": "bw-minimal",
+                "deviceName":       "bw-minimal",
             },
         )
         self.access_token = token_resp["access_token"]
 
-        # 5. Get vault key + decrypt with master key
-        profile = _get_json(f"{self.server}/api/accounts/profile",
-                            self.access_token)
+        # 4. Fetch profile — get encrypted vault key
+        profile = _get_json(
+            f"{self.server}/api/accounts/profile",
+            self.access_token,
+        )
         vault_key_cipher = profile["key"]
+
+        # 5. Decrypt vault key with stretched master key
         enc_key, mac_key = _stretch_key(master_key)
         vault_key_raw = _decrypt_cipher_string(vault_key_cipher, enc_key, mac_key)
-        self.enc_key = vault_key_raw[:32].encode() if isinstance(vault_key_raw, str) \
-            else vault_key_raw[:32]
-        self.mac_key = vault_key_raw[32:64].encode() if isinstance(vault_key_raw, str) \
-            else vault_key_raw[32:64]
+        # vault_key_raw is 64 bytes: first 32 = enc key, last 32 = mac key
+        if isinstance(vault_key_raw, str):
+            vault_key_bytes = vault_key_raw.encode("latin-1")
+        else:
+            vault_key_bytes = vault_key_raw
+        self.enc_key = vault_key_bytes[:32]
+        self.mac_key = vault_key_bytes[32:64]
 
         return self.access_token
 
-    def _post_json(self, url: str, data: dict) -> dict:
-        body = json.dumps(data).encode()
-        req = urllib.request.Request(url, data=body, method="POST")
-        req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read())
-
     def get(self, key: str) -> Optional[str]:
-        """Find secure note by name and return decrypted value."""
-        name = f"{ITEM_PREFIX}{key}"
+        """Find secure note by name 'kl: <key>' and return decrypted value."""
+        name_target = f"{ITEM_PREFIX}{key}"
         ciphers = _get_json(f"{self.server}/api/ciphers", self.access_token)
         for item in ciphers.get("Data", []):
-            item_name = _decrypt_cipher_string(
-                item["Name"], self.enc_key, self.mac_key
-            )
-            if item_name == name and item.get("Type") == 2:  # secure note
-                return _decrypt_cipher_string(
-                    item["Notes"], self.enc_key, self.mac_key
+            if item.get("Type") != 2:  # 2 = secure note
+                continue
+            try:
+                item_name = _decrypt_cipher_string(
+                    item["Name"], self.enc_key, self.mac_key
                 )
+            except Exception:
+                continue
+            if item_name == name_target:
+                notes = item.get("Notes")
+                if not notes:
+                    return ""
+                return _decrypt_cipher_string(notes, self.enc_key, self.mac_key)
         return None
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI entry point
 # ---------------------------------------------------------------------------
 
 def _get_session() -> BwSession:
-    server = os.environ.get("BW_SERVER", DEFAULT_SERVER)
-    email = os.environ.get("BW_EMAIL") or input("Email: ")
+    server = os.environ.get("BW_SERVER", SELF_HOSTED_DEFAULT)
+    email  = os.environ.get("BW_EMAIL")  or input("Email: ")
     master = os.environ.get("BW_MASTER") or getpass.getpass("Master password: ")
+    print(f"  Connecting to {server} ...", file=sys.stderr)
     s = BwSession(server, email, master)
     s.unlock()
     return s
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print("Usage: bw_minimal.py get <key> | set <key> <value> | unlock",
-              file=sys.stderr)
-        sys.exit(1)
+    _load_env()
+
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(
+            "Usage: bw_minimal.py <command> [args]\n"
+            "\n"
+            "Commands:\n"
+            "  get <key>          Read secret (secure note named 'kl: <key>')\n"
+            "  set <key> <value>  Write secret  [not yet implemented]\n"
+            "  unlock             Print session token\n"
+            "\n"
+            "Environment:\n"
+            "  BW_SERVER          Vaultwarden URL\n"
+            "  BW_EMAIL           Account email\n"
+            "  BW_MASTER          Master password (prefer prompt)\n"
+            "  KL_DOTFILES_ENV    Path to dotfiles env file\n",
+            file=sys.stderr,
+        )
+        sys.exit(0)
 
     cmd = sys.argv[1]
 
