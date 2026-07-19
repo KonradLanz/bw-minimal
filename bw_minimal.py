@@ -280,13 +280,11 @@ class BwSession:
 
         return self.access_token
 
-    def get(self, key: str) -> Optional[str]:
-        """Find secure note 'kl: <key>' and return decrypted value."""
+    def _find_item(self, key: str) -> Optional[dict]:
+        """Return the raw cipher dict for 'kl: <key>', any type."""
         name_target = f"{ITEM_PREFIX}{key}"
-        ciphers     = _get_json(f"{self.server}/api/ciphers", self.access_token)
+        ciphers = _get_json(f"{self.server}/api/ciphers", self.access_token)
         for item in ciphers.get("Data", []):
-            if item.get("Type") != 2:  # 2 = secure note
-                continue
             try:
                 item_name = _decrypt_cipher_string(
                     item["Name"], self.enc_key, self.mac_key
@@ -294,11 +292,42 @@ class BwSession:
             except Exception:
                 continue
             if item_name == name_target:
-                notes = item.get("Notes")
-                if not notes:
-                    return ""
-                return _decrypt_cipher_string(notes, self.enc_key, self.mac_key).decode("utf-8")
+                return item
         return None
+
+    def get(self, key: str) -> Optional[str]:
+        """Secure note (type 2): return decrypted Notes field."""
+        item = self._find_item(key)
+        if item is None:
+            return None
+        if item.get("Type") != 2:
+            raise RuntimeError(f"Item 'kl: {key}' is not a secure note (type {item.get('Type')}). Use get-user/get-pass for login items.")
+        notes = item.get("Notes")
+        if not notes:
+            return ""
+        return _decrypt_cipher_string(notes, self.enc_key, self.mac_key).decode("utf-8")
+
+    def get_user(self, key: str) -> Optional[str]:
+        """Login item (type 1): return decrypted username."""
+        item = self._find_item(key)
+        if item is None:
+            return None
+        login = item.get("Login") or {}
+        username = login.get("Username")
+        if not username:
+            return ""
+        return _decrypt_cipher_string(username, self.enc_key, self.mac_key).decode("utf-8")
+
+    def get_pass(self, key: str) -> Optional[str]:
+        """Login item (type 1): return decrypted password."""
+        item = self._find_item(key)
+        if item is None:
+            return None
+        login = item.get("Login") or {}
+        password = login.get("Password")
+        if not password:
+            return ""
+        return _decrypt_cipher_string(password, self.enc_key, self.mac_key).decode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +337,36 @@ class BwSession:
 def _get_session() -> BwSession:
     server = os.environ.get("BW_SERVER", SELF_HOSTED_DEFAULT)
     email  = os.environ.get("BW_EMAIL")  or input("Email: ")
+
+    # Reuse existing session token if set — skip full unlock (no master password needed)
+    existing_token = os.environ.get("BW_SESSION", "").strip()
+    if existing_token:
+        print(f"  Reusing BW_SESSION ({server}) ...", file=sys.stderr)
+        s = BwSession(server, email, "")
+        s.access_token = existing_token
+        # We still need enc/mac keys — fetch profile and derive from token
+        # Vaultwarden tokens carry the encrypted vault key; we need the master
+        # password to decrypt it. If BW_SESSION is set but BW_MASTER is not,
+        # prompt once and cache in env so subshells inherit it.
+        master = os.environ.get("BW_MASTER") or getpass.getpass("Master password: ")
+        os.environ["BW_MASTER"] = master  # cache for this process
+        try:
+            profile          = _get_json(f"{server}/api/accounts/profile", existing_token)
+            iterations       = _post_json(f"{server}/api/accounts/prelogin",
+                                          {"email": email}).get("kdfIterations", 600000)
+            master_key       = _pbkdf2(master, email.lower().strip(), iterations)
+            enc_key, mac_key = _stretch_key(master_key)
+            vault_key_bytes  = _decrypt_cipher_string(profile["key"], enc_key, mac_key)
+            s.enc_key = vault_key_bytes[:32]
+            s.mac_key = vault_key_bytes[32:64]
+            return s
+        except Exception as e:
+            # Token expired or invalid — fall through to full unlock
+            print(f"  BW_SESSION invalid/expired ({e}), re-authenticating ...", file=sys.stderr)
+            os.environ.pop("BW_SESSION", None)
+
     master = os.environ.get("BW_MASTER") or getpass.getpass("Master password: ")
+    os.environ["BW_MASTER"] = master
     print(f"  Connecting to {server} ...", file=sys.stderr)
     s = BwSession(server, email, master)
     s.unlock()
@@ -323,14 +381,17 @@ def main() -> None:
             "Usage: bw_minimal.py <command> [args]\n"
             "\n"
             "Commands:\n"
-            "  get <key>          Read secret (secure note named 'kl: <key>')\n"
+            "  get <key>          Secure note 'kl: <key>' — print Notes\n"
+            "  get-user <key>     Login item 'kl: <key>'  — print Username\n"
+            "  get-pass <key>     Login item 'kl: <key>'  — print Password\n"
+            "  unlock             Print session token (set as BW_SESSION)\n"
             "  set <key> <value>  Write secret  [not yet implemented]\n"
-            "  unlock             Print session token\n"
             "\n"
             "Environment:\n"
             "  BW_SERVER          Vaultwarden URL\n"
             "  BW_EMAIL           Account email\n"
             "  BW_MASTER          Master password (prefer prompt)\n"
+            "  BW_SESSION         Existing session token — skips re-auth\n"
             "  KL_DOTFILES_ENV    Path to dotfiles env file\n",
             file=sys.stderr,
         )
@@ -342,14 +403,20 @@ def main() -> None:
         s = _get_session()
         print(s.access_token)
 
-    elif cmd == "get":
+    elif cmd in ("get", "get-user", "get-pass"):
         if len(sys.argv) < 3:
-            print("Usage: bw_minimal.py get <key>", file=sys.stderr)
+            print(f"Usage: bw_minimal.py {cmd} <key>", file=sys.stderr)
             sys.exit(1)
-        s = _get_session()
-        val = s.get(sys.argv[2])
+        key = sys.argv[2]
+        s   = _get_session()
+        if cmd == "get":
+            val = s.get(key)
+        elif cmd == "get-user":
+            val = s.get_user(key)
+        else:
+            val = s.get_pass(key)
         if val is None:
-            print(f"Not found: {sys.argv[2]}", file=sys.stderr)
+            print(f"Not found: {key}", file=sys.stderr)
             sys.exit(2)
         print(val)
 
