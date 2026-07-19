@@ -233,10 +233,18 @@ class BwSession:
         iterations = prelogin.get("kdfIterations", 600000)
 
         # 2. Derive master key + master password hash
+        # Step 1: PBKDF2(password=master_password, salt=email, iter=N) -> master_key
         master_key  = _pbkdf2(self.master, self.email, iterations)
+        # Step 2: PBKDF2(password=master_key_bytes, salt=master_password, iter=1)
+        #         NOTE: master_key is raw bytes here, salt is the plain password
+        #         This is Bitwarden's specific two-step derivation.
         master_hash = base64.b64encode(
-            hashlib.pbkdf2_hmac("sha256", master_key,
-                                self.master.encode("utf-8"), 1)
+            hashlib.pbkdf2_hmac(
+                "sha256",
+                master_key,                        # bytes — NOT re-encoded
+                self.master.encode("utf-8"),        # plain password as salt
+                1,
+            )
         ).decode()
 
         # 3. Login — get access token
