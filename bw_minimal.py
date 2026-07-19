@@ -31,6 +31,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +41,11 @@ from typing import Optional
 SELF_HOSTED_DEFAULT = "https://vault.own.dedyn.io"
 CLOUD_DEFAULT       = "https://vault.bitwarden.com"
 ITEM_PREFIX         = "kl: "
+
+# Stable device identifier — derived from hostname so it's consistent across
+# runs on the same machine but unique per host. Vaultwarden requires a UUID.
+_DEVICE_ID = str(uuid.uuid5(uuid.NAMESPACE_DNS, os.uname().nodename
+                             if hasattr(os, "uname") else "bw-minimal"))
 
 
 # ---------------------------------------------------------------------------
@@ -57,8 +63,7 @@ def _parse_env_file(path: Path) -> dict[str, str]:
             key, _, val = line.partition("=")
             key = key.strip()
             val = val.strip().strip('"').strip("'")
-            # Skip placeholder comments and empty values
-            if val and not val.startswith("←"):
+            if val and not val.startswith("\u2190"):
                 result[key] = val
     except (OSError, UnicodeDecodeError):
         pass
@@ -75,8 +80,7 @@ def _load_env() -> None:
     script_dir = Path(__file__).parent
 
     # Layer 1: .env next to script
-    local_env = script_dir / ".env"
-    for k, v in _parse_env_file(local_env).items():
+    for k, v in _parse_env_file(script_dir / ".env").items():
         os.environ.setdefault(k, v)
 
     # Layer 2: dotfiles env
@@ -86,7 +90,6 @@ def _load_env() -> None:
     if dotfiles_env.is_file():
         for k, v in _parse_env_file(dotfiles_env).items():
             os.environ.setdefault(k, v)
-        # If dotfiles env found and BW_SERVER still unset, default to self-hosted
         os.environ.setdefault("BW_SERVER", SELF_HOSTED_DEFAULT)
     else:
         os.environ.setdefault("BW_SERVER", CLOUD_DEFAULT)
@@ -131,8 +134,8 @@ def _decrypt_cipher_string(cipher_str: str, enc_key: bytes, mac_key: bytes) -> s
         raise ValueError(f"Unsupported CipherString type: {cipher_str[:2]}")
     _, payload = cipher_str.split(".", 1)
     parts = payload.split("|")
-    iv = base64.b64decode(parts[0])
-    ct = base64.b64decode(parts[1])
+    iv  = base64.b64decode(parts[0])
+    ct  = base64.b64decode(parts[1])
     mac = base64.b64decode(parts[2])
 
     expected_mac = hmac.new(mac_key, iv + ct, "sha256").digest()
@@ -176,8 +179,12 @@ def _post_form(url: str, data: dict) -> dict:
     body = urllib.parse.urlencode(data).encode()
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        raise RuntimeError(f"HTTP {e.code} {e.reason} — {body}") from e
 
 
 def _post_json(url: str, data: dict, token: Optional[str] = None) -> dict:
@@ -186,15 +193,23 @@ def _post_json(url: str, data: dict, token: Optional[str] = None) -> dict:
     req.add_header("Content-Type", "application/json")
     if token:
         req.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        raise RuntimeError(f"HTTP {e.code} {e.reason} — {body}") from e
 
 
 def _get_json(url: str, token: str) -> dict:
     req = urllib.request.Request(url)
     req.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        raise RuntimeError(f"HTTP {e.code} {e.reason} — {body}") from e
 
 
 # ---------------------------------------------------------------------------
@@ -204,29 +219,28 @@ def _get_json(url: str, token: str) -> dict:
 class BwSession:
     def __init__(self, server: str, email: str, master: str):
         self.server = server.rstrip("/")
-        self.email = email
+        self.email  = email
         self.master = master
         self.access_token: Optional[str] = None
-        self.enc_key: Optional[bytes] = None
-        self.mac_key: Optional[bytes] = None
+        self.enc_key: Optional[bytes]    = None
+        self.mac_key: Optional[bytes]    = None
 
     def unlock(self) -> str:
         """Login + derive keys. Returns access token."""
         # 1. Prelogin — get KDF params
-        prelogin = _post_json(
-            f"{self.server}/api/accounts/prelogin",
-            {"email": self.email},
-        )
+        prelogin   = _post_json(f"{self.server}/api/accounts/prelogin",
+                                {"email": self.email})
         iterations = prelogin.get("kdfIterations", 600000)
 
         # 2. Derive master key + master password hash
-        master_key = _pbkdf2(self.master, self.email, iterations)
+        master_key  = _pbkdf2(self.master, self.email, iterations)
         master_hash = base64.b64encode(
             hashlib.pbkdf2_hmac("sha256", master_key,
                                 self.master.encode("utf-8"), 1)
         ).decode()
 
         # 3. Login — get access token
+        #    deviceIdentifier MUST be a valid UUID (Vaultwarden enforces this)
         token_resp = _post_form(
             f"{self.server}/identity/connect/token",
             {
@@ -236,36 +250,33 @@ class BwSession:
                 "scope":            "api offline_access",
                 "client_id":        "cli",
                 "deviceType":       "8",
-                "deviceIdentifier": "bw-minimal",
+                "deviceIdentifier": _DEVICE_ID,
                 "deviceName":       "bw-minimal",
             },
         )
         self.access_token = token_resp["access_token"]
 
         # 4. Fetch profile — get encrypted vault key
-        profile = _get_json(
-            f"{self.server}/api/accounts/profile",
-            self.access_token,
-        )
+        profile          = _get_json(f"{self.server}/api/accounts/profile",
+                                     self.access_token)
         vault_key_cipher = profile["key"]
 
         # 5. Decrypt vault key with stretched master key
-        enc_key, mac_key = _stretch_key(master_key)
-        vault_key_raw = _decrypt_cipher_string(vault_key_cipher, enc_key, mac_key)
-        # vault_key_raw is 64 bytes: first 32 = enc key, last 32 = mac key
-        if isinstance(vault_key_raw, str):
-            vault_key_bytes = vault_key_raw.encode("latin-1")
-        else:
-            vault_key_bytes = vault_key_raw
+        #    vault_key_raw is 64 bytes: [0:32] = enc key, [32:64] = mac key
+        enc_key, mac_key  = _stretch_key(master_key)
+        vault_key_raw     = _decrypt_cipher_string(vault_key_cipher, enc_key, mac_key)
+        vault_key_bytes   = (vault_key_raw.encode("latin-1")
+                             if isinstance(vault_key_raw, str)
+                             else vault_key_raw)
         self.enc_key = vault_key_bytes[:32]
         self.mac_key = vault_key_bytes[32:64]
 
         return self.access_token
 
     def get(self, key: str) -> Optional[str]:
-        """Find secure note by name 'kl: <key>' and return decrypted value."""
+        """Find secure note 'kl: <key>' and return decrypted value."""
         name_target = f"{ITEM_PREFIX}{key}"
-        ciphers = _get_json(f"{self.server}/api/ciphers", self.access_token)
+        ciphers     = _get_json(f"{self.server}/api/ciphers", self.access_token)
         for item in ciphers.get("Data", []):
             if item.get("Type") != 2:  # 2 = secure note
                 continue
