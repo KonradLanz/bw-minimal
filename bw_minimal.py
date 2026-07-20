@@ -367,6 +367,11 @@ def _get_session() -> BwSession:
 
     # Reuse existing session token — env takes priority, then ~/.bw_session
     existing_token = os.environ.get("BW_SESSION", "").strip() or _load_session_file()
+
+    # Prompt for master password ONCE — shared by reuse path and re-auth fallback.
+    master = os.environ.get("BW_MASTER") or getpass.getpass("Master password: ")
+    os.environ["BW_MASTER"] = master  # cache for this process + subshells
+
     if existing_token:
         print(f"  Reusing BW_SESSION ({server}) ...", file=sys.stderr)
         if not email:
@@ -374,12 +379,6 @@ def _get_session() -> BwSession:
             os.environ["BW_EMAIL"] = email
         s = BwSession(server, email, "")
         s.access_token = existing_token
-        # We still need enc/mac keys — fetch profile and derive from token
-        # Vaultwarden tokens carry the encrypted vault key; we need the master
-        # password to decrypt it. If BW_SESSION is set but BW_MASTER is not,
-        # prompt once and cache in env so subshells inherit it.
-        master = os.environ.get("BW_MASTER") or getpass.getpass("Master password: ")
-        os.environ["BW_MASTER"] = master  # cache for this process
         try:
             profile          = _get_json(f"{server}/api/accounts/profile", existing_token)
             iterations       = _post_json(f"{server}/api/accounts/prelogin",
@@ -398,8 +397,6 @@ def _get_session() -> BwSession:
     if not email:
         email = input("Email: ")
         os.environ["BW_EMAIL"] = email
-    master = os.environ.get("BW_MASTER") or getpass.getpass("Master password: ")
-    os.environ["BW_MASTER"] = master
     print(f"  Connecting to {server} ...", file=sys.stderr)
     s = BwSession(server, email, master)
     s.unlock()
