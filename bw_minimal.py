@@ -6,7 +6,9 @@
 #
 # Usage:
 #   python3 bw_minimal.py get "nas/ssh_pass"
-#   python3 bw_minimal.py set "nas/ssh_pass" "value"
+#   python3 bw_minimal.py set "nas/ssh_pass"           # prompts via GUI if terminal not a tty
+#   python3 bw_minimal.py set "nas/ssh_pass" "value"   # inline value (avoid in shell history)
+#   python3 bw_minimal.py pull                          # sync vault to ~/.bw_cache.json
 #   python3 bw_minimal.py unlock
 #
 # Environment (priority: shell env > dotfiles env > .env > prompt):
@@ -96,6 +98,53 @@ def _load_env() -> None:
 
 
 # ---------------------------------------------------------------------------
+# GUI secret prompt (tkinter, stdlib — falls back to getpass if unavailable)
+# ---------------------------------------------------------------------------
+
+def _prompt_secret_gui(prompt: str) -> str:
+    """
+    Show a native password dialog via tkinter.
+    Falls back to getpass if tkinter is unavailable or no display is found.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import simpledialog
+        root = tk.Tk()
+        root.withdraw()       # hide the empty root window
+        root.lift()
+        root.attributes("-topmost", True)
+        value = simpledialog.askstring(
+            "bw-minimal", prompt, show="*", parent=root
+        )
+        root.destroy()
+        if value is None:
+            print("Cancelled.", file=sys.stderr)
+            sys.exit(1)
+        return value
+    except Exception:
+        return getpass.getpass(prompt + " ")
+
+
+def _prompt_secret(prompt: str, inline_value: Optional[str] = None) -> str:
+    """
+    Return secret value from (in priority order):
+      1. inline_value if already provided (e.g. from CLI arg — warn about shell history)
+      2. GUI dialog if stdout is not a tty (called from script/IDE/opencode)
+      3. getpass terminal prompt otherwise
+    """
+    if inline_value is not None:
+        print(
+            "Warning: passing secrets as CLI args leaks them into shell history. "
+            "Omit the value to use the GUI prompt instead.",
+            file=sys.stderr,
+        )
+        return inline_value
+    if not sys.stdin.isatty():
+        return _prompt_secret_gui(prompt)
+    return getpass.getpass(prompt + " ")
+
+
+# ---------------------------------------------------------------------------
 # Crypto helpers (stdlib only)
 # ---------------------------------------------------------------------------
 
@@ -172,6 +221,46 @@ def _decrypt_aes_openssl(ct: bytes, key: bytes, iv: bytes) -> bytes:
         os.unlink(ct_path)
 
 
+def _encrypt_cipher_string(plaintext: str, enc_key: bytes, mac_key: bytes) -> str:
+    """
+    Encrypt to Bitwarden CipherString type 2 (AES-256-CBC + HMAC-SHA256).
+    Returns: '2.<iv_b64>|<ct_b64>|<mac_b64>'
+    """
+    iv = os.urandom(16)
+    pt = plaintext.encode("utf-8")
+    pad_len = 16 - (len(pt) % 16)
+    pt_padded = pt + bytes([pad_len] * pad_len)
+    try:
+        from Crypto.Cipher import AES
+        cipher = AES.new(enc_key, AES.MODE_CBC, iv)
+        ct = cipher.encrypt(pt_padded)
+    except ImportError:
+        ct = _encrypt_aes_openssl(pt_padded, enc_key, iv)
+    mac = hmac.new(mac_key, iv + ct, "sha256").digest()
+    b64 = base64.b64encode
+    return f"2.{b64(iv).decode()}|{b64(ct).decode()}|{b64(mac).decode()}"
+
+
+def _encrypt_aes_openssl(pt_padded: bytes, key: bytes, iv: bytes) -> bytes:
+    """AES-256-CBC encrypt via openssl subprocess (fallback, no pycryptodome)."""
+    import subprocess
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        f.write(pt_padded)
+        pt_path = f.name
+    try:
+        result = subprocess.run(
+            ["openssl", "enc", "-aes-256-cbc", "-nosalt", "-nopad",
+             "-K", key.hex(), "-iv", iv.hex(), "-in", pt_path],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise ValueError(f"openssl encrypt failed: {result.stderr.decode().strip()}")
+        return result.stdout
+    finally:
+        os.unlink(pt_path)
+
+
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
@@ -202,43 +291,19 @@ def _post_json(url: str, data: dict, token: Optional[str] = None) -> dict:
         raise RuntimeError(f"HTTP {e.code} {e.reason} — {body}") from e
 
 
-
-def _encrypt_cipher_string(plaintext: str, enc_key: bytes, mac_key: bytes) -> str:
-    """Encrypt to Bitwarden CipherString type 2 (AES-256-CBC + HMAC-SHA256).
-    Returns: '2.<iv_b64>|<ct_b64>|<mac_b64>'
-    """
-    iv = os.urandom(16)
-    pt = plaintext.encode("utf-8")
-    pad_len = 16 - (len(pt) % 16)
-    pt_padded = pt + bytes([pad_len] * pad_len)
+def _put_json(url: str, data: dict, token: Optional[str] = None) -> dict:
+    body = json.dumps(data).encode()
+    req = urllib.request.Request(url, data=body, method="PUT")
+    req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
     try:
-        from Crypto.Cipher import AES
-        cipher = AES.new(enc_key, AES.MODE_CBC, iv)
-        ct = cipher.encrypt(pt_padded)
-    except ImportError:
-        ct = _encrypt_aes_openssl(pt_padded, enc_key, iv)
-    mac = hmac.new(mac_key, iv + ct, "sha256").digest()
-    b64 = base64.b64encode
-    return f"2.{b64(iv).decode()}|{b64(ct).decode()}|{b64(mac).decode()}"
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        raise RuntimeError(f"HTTP {e.code} {e.reason} — {body}") from e
 
-
-def _encrypt_aes_openssl(pt_padded: bytes, key: bytes, iv: bytes) -> bytes:
-    """AES-256-CBC encrypt via openssl subprocess (fallback, no pycryptodome)."""
-    import subprocess, tempfile
-    with tempfile.NamedTemporaryFile(delete=False) as f:
-        f.write(pt_padded)
-        pt_path = f.name
-    try:
-        result = subprocess.run(
-            ["openssl", "enc", "-aes-256-cbc", "-nosalt", "-nopad",
-             "-K", key.hex(), "-iv", iv.hex(), "-in", pt_path],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            raise ValueError(f"openssl encrypt failed: {result.stderr.decode().strip()}")
-        return result.stdout
-    finally:
-        os.unlink(pt_path)
 
 def _get_json(url: str, token: str) -> dict:
     req = urllib.request.Request(url)
@@ -254,20 +319,6 @@ def _get_json(url: str, token: str) -> dict:
 # ---------------------------------------------------------------------------
 # Vaultwarden session
 # ---------------------------------------------------------------------------
-
-
-def _put_json(url: str, data: dict, token: Optional[str] = None) -> dict:
-    body = json.dumps(data).encode()
-    req = urllib.request.Request(url, data=body, method="PUT")
-    req.add_header("Content-Type", "application/json")
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        raise RuntimeError(f"HTTP {e.code} {e.reason} — {body}") from e
 
 class BwSession:
     def __init__(self, server: str, email: str, master: str):
@@ -390,8 +441,6 @@ class BwSession:
             return ""
         return _decrypt_cipher_string(password, self.enc_key, self.mac_key).decode("utf-8")
 
-
-
     def set(self, key: str, value: str) -> None:
         """Create or update a secure note named 'kl: <key>'."""
         item_name = ITEM_PREFIX + key
@@ -421,14 +470,16 @@ class BwSession:
             json.dump(ciphers, f)
         os.chmod(path, _stat.S_IRUSR | _stat.S_IWUSR)
         kl_count = sum(1 for c in ciphers if (c.get("type") or c.get("Type")) == 2)
-        print(f"Synced {len(ciphers)} ciphers ({kl_count} notes) → {path}", file=sys.stderr)
+        print(f"Synced {len(ciphers)} ciphers ({kl_count} notes) \u2192 {path}", file=sys.stderr)
         return kl_count
+
 
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
 _SESSION_FILE = os.path.expanduser("~/.bw_session")
+
 
 def _load_session_file() -> str:
     """Read cached session token from ~/.bw_session (600 perms)."""
@@ -438,6 +489,7 @@ def _load_session_file() -> str:
     except FileNotFoundError:
         return ""
 
+
 def _save_session_file(token: str) -> None:
     """Persist session token to ~/.bw_session with mode 600."""
     import stat
@@ -445,17 +497,15 @@ def _save_session_file(token: str) -> None:
         f.write(token)
     os.chmod(_SESSION_FILE, stat.S_IRUSR | stat.S_IWUSR)
 
+
 def _get_session() -> BwSession:
     server = os.environ.get("BW_SERVER", SELF_HOSTED_DEFAULT)
-    # Defer email prompt — only needed if BW_SESSION is absent or expired
     email  = os.environ.get("BW_EMAIL") or None
 
-    # Reuse existing session token — env takes priority, then ~/.bw_session
     existing_token = os.environ.get("BW_SESSION", "").strip() or _load_session_file()
 
-    # Prompt for master password ONCE — shared by reuse path and re-auth fallback.
     master = os.environ.get("BW_MASTER") or getpass.getpass("Master password: ")
-    os.environ["BW_MASTER"] = master  # cache for this process + subshells
+    os.environ["BW_MASTER"] = master
 
     if existing_token:
         print(f"  Reusing BW_SESSION ({server}) ...", file=sys.stderr)
@@ -475,7 +525,6 @@ def _get_session() -> BwSession:
             s.mac_key = vault_key_bytes[32:64]
             return s
         except Exception as e:
-            # Token expired or invalid — fall through to full unlock
             print(f"  BW_SESSION invalid/expired ({e}), re-authenticating ...", file=sys.stderr)
             os.environ.pop("BW_SESSION", None)
 
@@ -497,18 +546,19 @@ def main() -> None:
             "Usage: bw_minimal.py <command> [args]\n"
             "\n"
             "Commands:\n"
-            "  get <key>          Secure note 'kl: <key>' — print Notes\n"
-            "  get-user <key>     Login item 'kl: <key>'  — print Username\n"
-            "  get-pass <key>     Login item 'kl: <key>'  — print Password\n"
-            "  unlock             Print session token (set as BW_SESSION)\n"
-            "  set <key> <value>  Write secret  [not yet implemented]\n"
+            "  get <key>              Secure note 'kl: <key>' — print Notes\n"
+            "  get-user <key>         Login item 'kl: <key>'  — print Username\n"
+            "  get-pass <key>         Login item 'kl: <key>'  — print Password\n"
+            "  set <key> [value]      Create/update secure note; prompts GUI if value omitted\n"
+            "  pull                   Sync vault to ~/.bw_cache.json (chmod 600)\n"
+            "  unlock                 Print session token (set as BW_SESSION)\n"
             "\n"
             "Environment:\n"
-            "  BW_SERVER          Vaultwarden URL\n"
-            "  BW_EMAIL           Account email\n"
-            "  BW_MASTER          Master password (prefer prompt)\n"
-            "  BW_SESSION         Existing session token — skips re-auth\n"
-            "  KL_DOTFILES_ENV    Path to dotfiles env file\n",
+            "  BW_SERVER              Vaultwarden URL\n"
+            "  BW_EMAIL               Account email\n"
+            "  BW_MASTER              Master password (prefer prompt)\n"
+            "  BW_SESSION             Existing session token — skips re-auth\n"
+            "  KL_DOTFILES_ENV        Path to dotfiles env file\n",
             file=sys.stderr,
         )
         sys.exit(0)
@@ -538,8 +588,21 @@ def main() -> None:
         print(val)
 
     elif cmd == "set":
-        print("set: not yet implemented", file=sys.stderr)
-        sys.exit(1)
+        if len(sys.argv) < 3:
+            print("Usage: bw_minimal.py set <key> [value]", file=sys.stderr)
+            sys.exit(1)
+        key   = sys.argv[2]
+        # value from CLI arg (warn) or GUI/terminal prompt
+        value = _prompt_secret(
+            f"Value for '{key}':",
+            inline_value=sys.argv[3] if len(sys.argv) >= 4 else None,
+        )
+        s = _get_session()
+        s.set(key, value)
+
+    elif cmd == "pull":
+        s = _get_session()
+        s.pull()
 
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
