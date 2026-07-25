@@ -54,7 +54,8 @@ Example: `nas/ssh_pass` → item name `kl: nas/ssh_pass`.
 ## Status
 
 - [x] Repo structure
-- [ ] `bw_minimal.py` — prelogin + PBKDF2 + login + decrypt
+- [x] `bw_minimal.py` — prelogin + PBKDF2 + login + decrypt
+- [x] `set` + `pull` — encrypt + write + vault sync
 - [ ] `clients/bw_qnap.sh`
 - [ ] `clients/bw_windows.cmd`
 - [ ] Tests

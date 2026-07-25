@@ -38,7 +38,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SELF_HOSTED_DEFAULT = "https://vault.own.dedyn.io"
+SELF_HOSTED_DEFAULT = os.environ.get("VAULTWARDEN_URL", "https://vault.own.dedyn.io")
 CLOUD_DEFAULT       = "https://vault.bitwarden.com"
 ITEM_PREFIX         = "kl: "
 
@@ -202,6 +202,44 @@ def _post_json(url: str, data: dict, token: Optional[str] = None) -> dict:
         raise RuntimeError(f"HTTP {e.code} {e.reason} — {body}") from e
 
 
+
+def _encrypt_cipher_string(plaintext: str, enc_key: bytes, mac_key: bytes) -> str:
+    """Encrypt to Bitwarden CipherString type 2 (AES-256-CBC + HMAC-SHA256).
+    Returns: '2.<iv_b64>|<ct_b64>|<mac_b64>'
+    """
+    iv = os.urandom(16)
+    pt = plaintext.encode("utf-8")
+    pad_len = 16 - (len(pt) % 16)
+    pt_padded = pt + bytes([pad_len] * pad_len)
+    try:
+        from Crypto.Cipher import AES
+        cipher = AES.new(enc_key, AES.MODE_CBC, iv)
+        ct = cipher.encrypt(pt_padded)
+    except ImportError:
+        ct = _encrypt_aes_openssl(pt_padded, enc_key, iv)
+    mac = hmac.new(mac_key, iv + ct, "sha256").digest()
+    b64 = base64.b64encode
+    return f"2.{b64(iv).decode()}|{b64(ct).decode()}|{b64(mac).decode()}"
+
+
+def _encrypt_aes_openssl(pt_padded: bytes, key: bytes, iv: bytes) -> bytes:
+    """AES-256-CBC encrypt via openssl subprocess (fallback, no pycryptodome)."""
+    import subprocess, tempfile
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        f.write(pt_padded)
+        pt_path = f.name
+    try:
+        result = subprocess.run(
+            ["openssl", "enc", "-aes-256-cbc", "-nosalt", "-nopad",
+             "-K", key.hex(), "-iv", iv.hex(), "-in", pt_path],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise ValueError(f"openssl encrypt failed: {result.stderr.decode().strip()}")
+        return result.stdout
+    finally:
+        os.unlink(pt_path)
+
 def _get_json(url: str, token: str) -> dict:
     req = urllib.request.Request(url)
     req.add_header("Authorization", f"Bearer {token}")
@@ -216,6 +254,20 @@ def _get_json(url: str, token: str) -> dict:
 # ---------------------------------------------------------------------------
 # Vaultwarden session
 # ---------------------------------------------------------------------------
+
+
+def _put_json(url: str, data: dict, token: Optional[str] = None) -> dict:
+    body = json.dumps(data).encode()
+    req = urllib.request.Request(url, data=body, method="PUT")
+    req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        raise RuntimeError(f"HTTP {e.code} {e.reason} — {body}") from e
 
 class BwSession:
     def __init__(self, server: str, email: str, master: str):
@@ -338,6 +390,39 @@ class BwSession:
             return ""
         return _decrypt_cipher_string(password, self.enc_key, self.mac_key).decode("utf-8")
 
+
+
+    def set(self, key: str, value: str) -> None:
+        """Create or update a secure note named 'kl: <key>'."""
+        item_name = ITEM_PREFIX + key
+        enc_name  = _encrypt_cipher_string(item_name, self.enc_key, self.mac_key)
+        enc_notes = _encrypt_cipher_string(value,     self.enc_key, self.mac_key)
+        payload = {
+            "type": 2, "name": enc_name, "notes": enc_notes,
+            "secureNote": {"type": 0}, "favorite": False, "reprompt": 0,
+            "organizationId": None, "folderId": None, "fields": [],
+        }
+        existing = self._find_item(key)
+        if existing:
+            item_id = existing.get("id") or existing.get("Id")
+            _put_json(f"{self.server}/api/ciphers/{item_id}", payload, self.access_token)
+            print(f"Updated: kl: {key}", file=sys.stderr)
+        else:
+            _post_json(f"{self.server}/api/ciphers", payload, self.access_token)
+            print(f"Created: kl: {key}", file=sys.stderr)
+
+    def pull(self, cache_path: Optional[str] = None) -> int:
+        """Download full vault to ~/.bw_cache.json. Returns count of kl: items."""
+        import stat as _stat
+        sync    = _get_json(f"{self.server}/api/sync", self.access_token)
+        ciphers = sync.get("ciphers") or sync.get("Ciphers") or []
+        path    = cache_path or os.path.expanduser("~/.bw_cache.json")
+        with open(path, "w") as f:
+            json.dump(ciphers, f)
+        os.chmod(path, _stat.S_IRUSR | _stat.S_IWUSR)
+        kl_count = sum(1 for c in ciphers if (c.get("type") or c.get("Type")) == 2)
+        print(f"Synced {len(ciphers)} ciphers ({kl_count} notes) → {path}", file=sys.stderr)
+        return kl_count
 
 # ---------------------------------------------------------------------------
 # CLI entry point
