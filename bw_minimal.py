@@ -331,6 +331,8 @@ class BwSession:
 
     def unlock(self) -> str:
         """Login + derive keys. Returns access token."""
+        _debug_auth = os.environ.get("BW_DEBUG_AUTH") == "1"
+
         # 1. Prelogin — get KDF params
         prelogin   = _post_json(f"{self.server}/api/accounts/prelogin",
                                 {"email": self.email})
@@ -338,8 +340,19 @@ class BwSession:
 
         # 2. Derive master key + master password hash
         # Bitwarden spec: email salt must be lowercased + stripped
+        email_for_kdf = self.email.lower().strip()
+
+        if _debug_auth:
+            print(f"[BW_DEBUG_AUTH] email raw     = {repr(self.email)}", file=sys.stderr)
+            print(f"[BW_DEBUG_AUTH] email for KDF = {repr(email_for_kdf)}", file=sys.stderr)
+            print(f"[BW_DEBUG_AUTH] kdfIterations = {iterations}", file=sys.stderr)
+
         # Step 1: PBKDF2(password=master_password, salt=email.lower().strip(), iter=N) -> master_key
-        master_key  = _pbkdf2(self.master, self.email.lower().strip(), iterations)
+        master_key  = _pbkdf2(self.master, email_for_kdf, iterations)
+
+        if _debug_auth:
+            print(f"[BW_DEBUG_AUTH] master_key[:4] = {master_key.hex()[:8]}", file=sys.stderr)
+
         # Step 2: PBKDF2(password=master_key_bytes, salt=master_password, iter=1)
         #         NOTE: master_key is raw bytes here, salt is the plain password
         #         This is Bitwarden's specific two-step derivation.
@@ -499,8 +512,19 @@ def _save_session_file(token: str) -> None:
 
 
 def _get_session() -> BwSession:
+    _debug_auth = os.environ.get("BW_DEBUG_AUTH") == "1"
     server = os.environ.get("BW_SERVER", SELF_HOSTED_DEFAULT)
-    email  = os.environ.get("BW_EMAIL") or None
+
+    # Determine which env layer supplied BW_EMAIL
+    _email_from_shell   = os.environ.get("BW_EMAIL")
+    email = _email_from_shell or None
+
+    if _debug_auth:
+        if _email_from_shell:
+            print(f"[BW_DEBUG_AUTH] BW_EMAIL source = shell/env ({repr(_email_from_shell)})", file=sys.stderr)
+        else:
+            print("[BW_DEBUG_AUTH] BW_EMAIL source = not set (will prompt)", file=sys.stderr)
+        print(f"[BW_DEBUG_AUTH] BW_SERVER = {repr(server)}", file=sys.stderr)
 
     existing_token = os.environ.get("BW_SESSION", "").strip() or _load_session_file()
 
@@ -512,6 +536,8 @@ def _get_session() -> BwSession:
         if not email:
             email = input("Email: ")
             os.environ["BW_EMAIL"] = email
+            if _debug_auth:
+                print(f"[BW_DEBUG_AUTH] BW_EMAIL source = interactive prompt ({repr(email)})", file=sys.stderr)
         s = BwSession(server, email, "")
         s.access_token = existing_token
         try:
@@ -531,6 +557,8 @@ def _get_session() -> BwSession:
     if not email:
         email = input("Email: ")
         os.environ["BW_EMAIL"] = email
+        if _debug_auth:
+            print(f"[BW_DEBUG_AUTH] BW_EMAIL source = interactive prompt ({repr(email)})", file=sys.stderr)
     print(f"  Connecting to {server} ...", file=sys.stderr)
     s = BwSession(server, email, master)
     s.unlock()
