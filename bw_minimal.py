@@ -551,7 +551,15 @@ def _get_session() -> BwSession:
             s.mac_key = vault_key_bytes[32:64]
             return s
         except Exception as e:
-            print(f"  BW_SESSION invalid/expired ({e}), re-authenticating ...", file=sys.stderr)
+            # Trim noisy HTML bodies from 401 responses down to a one-liner
+            e_str = str(e)
+            if "401" in e_str:
+                e_msg = "session token expired (HTTP 401)"
+            elif len(e_str) > 120:
+                e_msg = e_str[:120] + "..."
+            else:
+                e_msg = e_str
+            print(f"  BW_SESSION invalid/expired ({e_msg}), re-authenticating ...", file=sys.stderr)
             os.environ.pop("BW_SESSION", None)
 
     if not email:
