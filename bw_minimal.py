@@ -528,8 +528,10 @@ def _get_session() -> BwSession:
 
     existing_token = os.environ.get("BW_SESSION", "").strip() or _load_session_file()
 
+    # Master password is always needed (for vault key decryption even with cached token).
+    # Read from env first so repeated subprocess calls within the same shell skip the prompt.
     master = os.environ.get("BW_MASTER") or getpass.getpass("Master password: ")
-    os.environ["BW_MASTER"] = master
+    os.environ["BW_MASTER"] = master  # cache for any further calls in this process tree
 
     if existing_token:
         print(f"  Reusing BW_SESSION ({server}) ...", file=sys.stderr)
