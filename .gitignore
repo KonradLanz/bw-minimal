@@ -3,3 +3,8 @@ __pycache__/
 *.pyo
 .env
 *.session
+
+# Added by overnight health pass
+venv/
+node_modules/
+.DS_Store
