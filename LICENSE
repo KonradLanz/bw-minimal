@@ -1,0 +1,47 @@
+# License — bw-minimal
+
+SPDX-License-Identifier: AGPL-3.0-or-later OR MIT
+
+Copyright © 2026 GrEEV.com KG, Wien, Österreich  
+Web: www.greev.com | Email: office@greev.com
+
+---
+
+This project adopts the **ExecutionPolicy Foundation dual-license model**  
+(AGPL-3.0-or-later OR MIT) by reference.
+
+The canonical, authoritative license text is maintained at:
+
+> **https://github.com/KonradLanz/ExecutionPolicy-Foundation/blob/main/LICENSE**
+
+All terms and conditions defined there apply to this repository without  
+modification. In case of any discrepancy between this notice and the  
+canonical source, the canonical source takes precedence.
+
+---
+
+## Quick Reference
+
+| Use Case                          | Applicable License |
+|-----------------------------------|--------------------|
+| Open-source project / internal tool | AGPLv3             |
+| Commercial, SaaS, Closed-Source   | MIT                |
+| Enterprise / Support SLA          | office@greev.com   |
+
+**Rule of thumb:**
+- Open-source or internal → **AGPL-3.0-or-later**
+- Commercial / Closed-Source → **MIT**
+- Unsure or need support → office@greev.com
+
+---
+
+## Full License Text
+
+See: https://github.com/KonradLanz/ExecutionPolicy-Foundation/blob/main/LICENSE
+
+- Option A (AGPLv3): https://www.gnu.org/licenses/agpl-3.0.txt  
+- Option B (MIT): https://github.com/KonradLanz/ExecutionPolicy-Foundation/blob/main/MIT-LICENSE
+
+---
+
+SPDX-License-Identifier: AGPL-3.0-or-later OR MIT
