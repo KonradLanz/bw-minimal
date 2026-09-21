@@ -122,14 +122,29 @@ def _prompt_secret_gui(prompt: str) -> str:
             sys.exit(1)
         return value
     except Exception:
-        return getpass.getpass(prompt + " ")
+        return _safe_getpass(prompt)
+
+
+def _safe_getpass(prompt: str) -> str:
+    """getpass only on a real TTY — never fall back to echoing stdin (leaks into logs/history)."""
+    if not sys.stdin.isatty():
+        print(
+            "Refusing password prompt: no TTY (would echo into logs/pipes). "
+            "Unlock in a real terminal first, or set BW_MASTER in this process only.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if os.environ.get("BW_NO_PROMPT") == "1":
+        print("Refusing password prompt: BW_NO_PROMPT=1.", file=sys.stderr)
+        sys.exit(2)
+    return getpass.getpass(prompt + " ")
 
 
 def _prompt_secret(prompt: str, inline_value: Optional[str] = None) -> str:
     """
     Return secret value from (in priority order):
       1. inline_value if already provided (e.g. from CLI arg — warn about shell history)
-      2. GUI dialog if stdout is not a tty (called from script/IDE/opencode)
+      2. GUI dialog if stdin is not a tty (script/LaunchAgent/IDE) — never echoing getpass
       3. getpass terminal prompt otherwise
     """
     if inline_value is not None:
@@ -139,9 +154,12 @@ def _prompt_secret(prompt: str, inline_value: Optional[str] = None) -> str:
             file=sys.stderr,
         )
         return inline_value
+    if os.environ.get("BW_NO_PROMPT") == "1":
+        print("Refusing password prompt: BW_NO_PROMPT=1.", file=sys.stderr)
+        sys.exit(2)
     if not sys.stdin.isatty():
         return _prompt_secret_gui(prompt)
-    return getpass.getpass(prompt + " ")
+    return _safe_getpass(prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +491,27 @@ class BwSession:
             _post_json(f"{self.server}/api/ciphers", payload, self.access_token)
             print(f"Created: kl: {key}", file=sys.stderr)
 
+    def set_login(self, key: str, username: str, password: str) -> None:
+        """Create or update a Login item (type 1) named 'kl: <key>'."""
+        item_name   = ITEM_PREFIX + key
+        enc_name    = _encrypt_cipher_string(item_name, self.enc_key, self.mac_key)
+        enc_user    = _encrypt_cipher_string(username,  self.enc_key, self.mac_key)
+        enc_pass    = _encrypt_cipher_string(password,  self.enc_key, self.mac_key)
+        payload = {
+            "type": 1, "name": enc_name, "notes": None,
+            "login": {"username": enc_user, "password": enc_pass, "uris": []},
+            "favorite": False, "reprompt": 0,
+            "organizationId": None, "folderId": None, "fields": [],
+        }
+        existing = self._find_item(key)
+        if existing:
+            item_id = existing.get("id") or existing.get("Id")
+            _put_json(f"{self.server}/api/ciphers/{item_id}", payload, self.access_token)
+            print(f"Updated login: kl: {key}", file=sys.stderr)
+        else:
+            _post_json(f"{self.server}/api/ciphers", payload, self.access_token)
+            print(f"Created login: kl: {key}", file=sys.stderr)
+
     def pull(self, cache_path: Optional[str] = None) -> int:
         """Download full vault to ~/.bw_cache.json. Returns count of kl: items."""
         import stat as _stat
@@ -530,7 +569,8 @@ def _get_session() -> BwSession:
 
     # Master password is always needed (for vault key decryption even with cached token).
     # Read from env first so repeated subprocess calls within the same shell skip the prompt.
-    master = os.environ.get("BW_MASTER") or getpass.getpass("Master password: ")
+    # Never use raw getpass here — without a TTY it can echo into redirected logs/history.
+    master = os.environ.get("BW_MASTER") or _prompt_secret("Master password:")
     os.environ["BW_MASTER"] = master  # cache for any further calls in this process tree
 
     if existing_token:
