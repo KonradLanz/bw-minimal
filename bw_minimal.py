@@ -472,6 +472,41 @@ class BwSession:
             return ""
         return _decrypt_cipher_string(password, self.enc_key, self.mac_key).decode("utf-8")
 
+    def list_items(self) -> list[dict]:
+        """Decrypted name, type, and username for every cipher.
+
+        Passwords and note bodies stay on the server ciphertext.
+        """
+        ciphers = _get_json(f"{self.server}/api/ciphers", self.access_token)
+        rows = ciphers.get("Data") or ciphers.get("data") or []
+        out: list[dict] = []
+        for item in rows:
+            login = item.get("login") or item.get("Login") or {}
+            out.append({
+                "name": self._decrypt_text(item.get("name") or item.get("Name") or ""),
+                "type": item.get("type") if item.get("type") is not None else item.get("Type") or 0,
+                "username": self._decrypt_text(
+                    login.get("username") or login.get("Username") or ""
+                ),
+            })
+        return out
+
+    def _decrypt_text(self, raw: str) -> str:
+        if not raw:
+            return ""
+        try:
+            return _decrypt_cipher_string(raw, self.enc_key, self.mac_key).decode("utf-8")
+        except Exception:
+            return raw
+
+    def get_note(self, key: str) -> Optional[str]:
+        """Secure Note (type 2): return decrypted notes field. Alias for get()."""
+        return self.get(key)
+
+    def set_note(self, key: str, value: str) -> None:
+        """Create or update a Secure Note named 'kl: <key>'. Alias for set()."""
+        self.set(key, value)
+
     def set(self, key: str, value: str) -> None:
         """Create or update a secure note named 'kl: <key>'."""
         item_name = ITEM_PREFIX + key
@@ -492,7 +527,10 @@ class BwSession:
             print(f"Created: kl: {key}", file=sys.stderr)
 
     def set_login(self, key: str, username: str, password: str) -> None:
-        """Create or update a Login item (type 1) named 'kl: <key>'."""
+        """Create or update a Login item (type 1) named 'kl: <key>'.
+        If an existing item has the wrong type (e.g. Secure Note type 2),
+        it is deleted first — Vaultwarden ignores type changes on PUT.
+        """
         item_name   = ITEM_PREFIX + key
         enc_name    = _encrypt_cipher_string(item_name, self.enc_key, self.mac_key)
         enc_user    = _encrypt_cipher_string(username,  self.enc_key, self.mac_key)
@@ -505,9 +543,23 @@ class BwSession:
         }
         existing = self._find_item(key)
         if existing:
-            item_id = existing.get("id") or existing.get("Id")
-            _put_json(f"{self.server}/api/ciphers/{item_id}", payload, self.access_token)
-            print(f"Updated login: kl: {key}", file=sys.stderr)
+            item_id   = existing.get("id") or existing.get("Id")
+            item_type = existing.get("type") or existing.get("Type")
+            if item_type != 1:
+                # Wrong type — delete and recreate, Vaultwarden ignores type on PUT
+                import urllib.request as _ur
+                req = _ur.Request(
+                    f"{self.server}/api/ciphers/{item_id}",
+                    method="DELETE",
+                    headers={"Authorization": f"Bearer {self.access_token}"},
+                )
+                _ur.urlopen(req).read()
+                print(f"Deleted stale type-{item_type} item: kl: {key}", file=sys.stderr)
+                _post_json(f"{self.server}/api/ciphers", payload, self.access_token)
+                print(f"Created login: kl: {key}", file=sys.stderr)
+            else:
+                _put_json(f"{self.server}/api/ciphers/{item_id}", payload, self.access_token)
+                print(f"Updated login: kl: {key}", file=sys.stderr)
         else:
             _post_json(f"{self.server}/api/ciphers", payload, self.access_token)
             print(f"Created login: kl: {key}", file=sys.stderr)
@@ -530,7 +582,9 @@ class BwSession:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-_SESSION_FILE = os.path.expanduser("~/.bw_session")
+_SESSION_FILE      = os.path.expanduser("~/.bw_session")
+_MASTER_CACHE_FILE = os.path.expanduser("~/git/bw-minimal/.bw_master_cache")
+_MASTER_CACHE_TTL  = 900  # 15 min, like sudo
 
 
 def _load_session_file() -> str:
@@ -540,6 +594,31 @@ def _load_session_file() -> str:
             return f.read().strip()
     except FileNotFoundError:
         return ""
+
+
+def _load_master_cache() -> str:
+    """Read cached BW master password from ~/.bw_master_cache if TTL is still valid."""
+    try:
+        st = os.stat(_MASTER_CACHE_FILE)
+        if (Path().stat if False else 0):
+            pass
+        age = max(0, int(__import__('time').time() - st.st_mtime))
+        if age > _MASTER_CACHE_TTL:
+            return ""
+        with open(_MASTER_CACHE_FILE) as f:
+            return f.read().rstrip("\n")
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        return ""
+
+
+def _save_master_cache(master: str) -> None:
+    """Persist BW master password to ~/.bw_master_cache with mode 600."""
+    import stat
+    with open(_MASTER_CACHE_FILE, "w") as f:
+        f.write(master)
+    os.chmod(_MASTER_CACHE_FILE, stat.S_IRUSR | stat.S_IWUSR)
 
 
 def _save_session_file(token: str) -> None:
@@ -568,10 +647,11 @@ def _get_session() -> BwSession:
     existing_token = os.environ.get("BW_SESSION", "").strip() or _load_session_file()
 
     # Master password is always needed (for vault key decryption even with cached token).
-    # Read from env first so repeated subprocess calls within the same shell skip the prompt.
+    # Priority: process env -> sudo-style cache file (15 min) -> prompt.
     # Never use raw getpass here — without a TTY it can echo into redirected logs/history.
-    master = os.environ.get("BW_MASTER") or _prompt_secret("Master password:")
-    os.environ["BW_MASTER"] = master  # cache for any further calls in this process tree
+    master = os.environ.get("BW_MASTER") or _load_master_cache() or _prompt_secret("Master password:")
+    os.environ["BW_MASTER"] = master  # cache for this process tree
+    _save_master_cache(master)         # cache across processes for a short TTL
 
     if existing_token:
         print(f"  Reusing BW_SESSION ({server}) ...", file=sys.stderr)
@@ -616,6 +696,22 @@ def _get_session() -> BwSession:
     return s
 
 
+def make_session() -> BwSession:
+    """Return an unlocked BwSession. Not a singleton — call this per script.
+
+    Coordinates env, the 15-minute master-password cache, and the prompt:
+    ``_load_env()``, then ``BW_MASTER`` / ``_load_master_cache()`` /
+    ``_prompt_secret()``, then a reusable ``BW_SESSION`` or ``unlock()``.
+
+    Password cache rules:
+    - Master password: cached 15 minutes via ``_save_master_cache``.
+    - Export password: never. Callers use ``getpass.getpass()`` and ``del``.
+    - API passwords (Forgejo and others): never cached here; use ``get_pass()``.
+    """
+    _load_env()
+    return _get_session()
+
+
 def main() -> None:
     _load_env()
 
@@ -644,7 +740,7 @@ def main() -> None:
     cmd = sys.argv[1]
 
     if cmd == "unlock":
-        s = _get_session()
+        s = make_session()
         _save_session_file(s.access_token)
         print(s.access_token)
 
@@ -653,7 +749,7 @@ def main() -> None:
             print(f"Usage: bw_minimal.py {cmd} <key>", file=sys.stderr)
             sys.exit(1)
         key = sys.argv[2]
-        s   = _get_session()
+        s   = make_session()
         if cmd == "get":
             val = s.get(key)
         elif cmd == "get-user":
@@ -675,11 +771,11 @@ def main() -> None:
             f"Value for '{key}':",
             inline_value=sys.argv[3] if len(sys.argv) >= 4 else None,
         )
-        s = _get_session()
+        s = make_session()
         s.set(key, value)
 
     elif cmd == "pull":
-        s = _get_session()
+        s = make_session()
         s.pull()
 
     else:
